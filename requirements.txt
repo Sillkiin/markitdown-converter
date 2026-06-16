@@ -1,0 +1,11 @@
+# Full MarkItDown stack (every optional backend). Tested against markitdown 0.1.6.
+markitdown[all]>=0.1.6
+# Used by the script's graceful offline fallbacks:
+python-docx>=1.0      # .docx fallback
+openpyxl>=3.1         # .xlsx fallback
+Pillow>=10.0          # image metadata/EXIF fallback
+# Optional, only if you use --llm-model for image descriptions:
+# openai>=1.0
+# Test-only: builds sample PDFs in tests/ (NOT used by the converter itself).
+# python-pptx (sample .pptx) already arrives via markitdown[all].
+reportlab>=4.0
