@@ -97,6 +97,45 @@ _m2=ct(P("esc.xlsx")); check("37 xlsx escapes pipe+newline (table not broken)", 
 _wb3=_ox.Workbook(); _ws3=_wb3.active; _ws3.append(["x","y","total"]); _ws3.append([3,10,None]); _ws3["C2"]="=A2+B2"; _wb3.save(P("frm.xlsx"))
 _m3=ct(P("frm.xlsx")); check("38 xlsx uncached formula surfaced (not silent blank)", "=A2+B2" in _m3)
 
+# csv/tsv: native MarkItDown does NOT escape '|'/newlines or tabulate .tsv
+open(P("pipe.csv"),"w",encoding="utf-8",newline="").write('Note,Detail\n"a|b","l1\nl2"\nC,"x, y"\n')
+_mc=ct(P("pipe.csv")); _rows=[r for r in _mc.splitlines() if r.startswith("|")]; _cols=[r.replace("\\|","").count("|") for r in _rows]
+check("39 csv escapes pipe+newline (table not broken)", "a\\|b" in _mc and "l1<br>l2" in _mc and len(set(_cols))==1, "cols=%s"%_cols)
+check("40 tsv tabulated (not raw text)", "| a | b |" in ct(P("data.tsv")))
+open(P("semi.csv"),"w",encoding="utf-8").write("name;city;score\nAnna;Moscow;5\n")
+check("41 semicolon csv tabulated","| name | city | score |" in ct(P("semi.csv")))
+open(P("crlf.csv"),"wb").write(b"h1,h2\r\nv1,v2\r\n")
+_mcl=ct(P("crlf.csv")); check("42 crlf csv no stray <br>/CR", "| v1 | v2 |" in _mcl and "<br>" not in _mcl and "\r" not in _mcl)
+
+# --- bug-hunt regression fixes (charset window, utf-16, sniff, url-name, broken pipe) ---
+# 43: non-ASCII bytes start PAST the 256KB detection window -> must not mis-commit to utf-8
+open(P("bigtail.csv"),"wb").write(("filler_ascii_line,value,note\n"*(262144//29+60)).encode("ascii")+"Привет,мир,конец\n".encode("cp1251"))
+check("43 late single-byte tail not mis-utf8 (no false fail)", "Привет" in ct(P("bigtail.csv")))
+# 44: BOM-less UTF-16 must tabulate, not become NUL-interleaved mojibake
+open(P("u16le.csv"),"wb").write("Name,City\nAlice,NYC\n".encode("utf-16-le"))
+_u16=ct(P("u16le.csv")); check("44 utf-16 no-BOM real table (no NUL mojibake)", "| Name | City |" in _u16 and "\x00" not in _u16)
+# 45: comma CSV with a quoted ';' notes cell must stay multi-column (sniff is quoting-aware)
+open(P("notes.csv"),"w",encoding="utf-8",newline="").write('"see a; b; c",Name,Score\n"x; y",Alice,10\n')
+check("45 quoted-semicolon doesn't collapse comma csv", "| Name | Score |" in ct(P("notes.csv")))
+# 46: URL-derived name must never contain ':' (a bare ':' becomes a hidden NTFS ADS = data loss)
+check("46 url colon sanitized (no NTFS ADS)", ":" not in conv.out_name_for("http://h.example.com/report:final.pdf") and ":" not in conv.out_name_for("http://x.com:8080"))
+# 47: URL fragment/query stripped, '/' in a query not mis-parsed as the path
+check("47 url fragment/query stripped", conv.out_name_for("http://x.com/a.pdf#frag?y=1")=="a.pdf.md" and conv.out_name_for("http://x.com/a?b=/c/d")=="a.md")
+# 48: a closed stdout pipe (BrokenPipeError) must not raise out of the echo (file is authoritative)
+class _BrokenOut:
+    encoding="utf-8"; buffer=None
+    def write(self,*a): raise BrokenPipeError(32,"Broken pipe")
+    def fileno(self): raise OSError("no fileno")
+    def flush(self): pass
+_saved=sys.stdout; _ok=True
+try:
+    sys.stdout=_BrokenOut(); conv._echo_stdout("hello world")
+except BaseException:
+    _ok=False
+finally:
+    sys.stdout=_saved
+check("48 broken-pipe echo no-raise (no false exit1)", _ok)
+
 tb=sum(b.count("Traceback (most recent call last)") for b in stderr_blobs)
 check("35 ZERO tracebacks across CLI runs",tb==0,"tracebacks=%d"%tb)
 

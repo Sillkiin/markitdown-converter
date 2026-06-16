@@ -36,6 +36,7 @@ Install MarkItDown with every backend:
     pip install 'markitdown[all]'    # add --break-system-packages on a managed Python
 """
 import argparse
+import codecs
 import os
 import sys
 import subprocess
@@ -152,15 +153,34 @@ def expand_inputs(inputs, recursive=False):
     return expanded
 
 
+_ILLEGAL_FN_CHARS = '<>:"/\\|?*'
+
+
+def _sanitize_filename(name):
+    """Strip characters illegal in a filename and never return ''. Critically, a
+    bare ':' on NTFS makes open('name:stream', 'w') succeed by writing to a hidden
+    Alternate Data Stream instead of failing - so an unsanitized URL-derived name
+    like 'report:final.pdf' silently loses the output to an ADS while reporting
+    success. Replace the Windows-illegal set and control chars, drop trailing dots/
+    spaces (also illegal on Windows), and reject pure-dot/empty names."""
+    cleaned = "".join("_" if (c in _ILLEGAL_FN_CHARS or ord(c) < 32) else c
+                      for c in name).strip(" .")
+    return cleaned if cleaned not in ("", ".", "..") else "output"
+
+
 def out_name_for(inp, keep_ext=False):
-    """Derive a base .md filename for a given input file or URL."""
+    """Derive a safe base .md filename for a given input file or URL."""
     if is_url(inp):
-        base = inp.rstrip("/").split("/")[-1].split("?")[0] or "output"
-        return base + ".md"
+        from urllib.parse import urlsplit
+        import posixpath
+        # urlsplit drops the query/fragment; posixpath.basename takes the last path
+        # segment without mis-parsing a query value that contains '/'.
+        base = posixpath.basename(urlsplit(inp).path.rstrip("/")) or "output"
+        return _sanitize_filename(base) + ".md"
     fname = os.path.basename(inp.rstrip("/\\")) or "output"
     if keep_ext:
-        return fname + ".md"
-    return (os.path.splitext(fname)[0] or "output") + ".md"
+        return _sanitize_filename(fname) + ".md"
+    return _sanitize_filename(os.path.splitext(fname)[0] or "output") + ".md"
 
 
 def unique_target(directory, name, used):
@@ -198,6 +218,47 @@ def _looks_utf8(prefix):
             except Exception:
                 return False
         return False
+
+
+def _whole_file_decodes(path, enc):
+    """True if the ENTIRE file decodes under *enc*, streamed in 1 MB chunks through
+    an incremental decoder (O(1) memory, correct across multibyte chunk boundaries).
+    detect_charset only reads a bounded prefix, so a file that is pure ASCII for the
+    first 256 KB and then has single-byte (cp1251/latin-1) content would otherwise be
+    wrongly committed to utf-8 and fail the full-file decode downstream. Used to
+    confirm a charset over the whole file before trusting it."""
+    try:
+        dec = codecs.getincrementaldecoder(enc)()
+    except LookupError:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)
+                if not chunk:
+                    dec.decode(b"", final=True)
+                    return True
+                dec.decode(chunk)
+    except (UnicodeDecodeError, OSError):
+        return False
+
+
+def _detect_utf16_no_bom(raw):
+    """Return 'utf-16-le'/'utf-16-be'/'utf-16' if *raw* looks like BOM-less UTF-16,
+    else None. ASCII text encoded as UTF-16 is ~50% NUL bytes (every other byte),
+    which is otherwise valid UTF-8 and would be silently mojibake'd. NUL position
+    (odd vs even) reveals the byte order."""
+    if not raw:
+        return None
+    if raw.count(0) / len(raw) <= 0.25:
+        return None
+    even_nul = raw[0::2].count(0)
+    odd_nul = raw[1::2].count(0)
+    if odd_nul > even_nul * 3:
+        return "utf-16-le"   # NUL in the high byte -> little-endian
+    if even_nul > odd_nul * 3:
+        return "utf-16-be"
+    return "utf-16"
 
 
 # charset_normalizer is unreliable on short, mostly-ASCII byte strings: for a few
@@ -248,8 +309,28 @@ def detect_charset(path):
         raw = fh.read(DETECT_BYTES)
     if raw.startswith(b"\xef\xbb\xbf"):
         return "utf-8-sig"
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"  # BOM-tagged UTF-16 (charset_normalizer also handles it)
+    # BOM-less UTF-16 is ~50% NUL bytes, which are valid UTF-8 and would otherwise
+    # be accepted below and silently produce NUL-interleaved mojibake.
+    utf16 = _detect_utf16_no_bom(raw)
+    if utf16:
+        return utf16
+    # Trust utf-8 only if the WHOLE file is valid utf-8, not merely the prefix:
+    # a large file whose non-ASCII bytes start past the prefix must not be
+    # mis-committed to utf-8 (its full-file decode would then fail).
     if _looks_utf8(raw):
-        return "utf-8"
+        if len(raw) < DETECT_BYTES or _whole_file_decodes(path, "utf-8"):
+            return "utf-8"
+        # Prefix is ASCII/utf-8 but the full file is not: the distinguishing
+        # single-byte content is past the detection window, so charset_normalizer
+        # on the prefix can't see it. Pick a single-byte encoding that decodes the
+        # whole file (locale first, then latin-1 which never fails) to avoid both
+        # a spurious decode failure and silent mojibake.
+        for enc in _locale_single_byte_candidates():
+            if _whole_file_decodes(path, enc):
+                return enc
+        return "latin-1"
 
     guess = None
     try:
@@ -377,6 +458,61 @@ def xlsx_fallback(path):
     return "\n".join(out).strip() + "\n"
 
 
+def _sniff_delimiter(header_line):
+    """Pick a delimiter from the header line, preferring comma on a tie. MarkItDown's
+    native CSV reader does not sniff, so a European 'name;city;score' .csv otherwise
+    collapses into a single column; this lets it tabulate without regressing comma
+    CSVs. Quoting-aware: it parses the line with each candidate delimiter via the csv
+    module and picks the one yielding the most fields, so delimiters that merely sit
+    INSIDE a quoted cell (e.g. a comma CSV with a "see a; b; c" notes column) don't
+    win - a naive character count would mis-pick ';' and collapse the table."""
+    import csv as _csv
+    import io
+    best, best_n = ",", 0
+    for d in (",", ";", "\t"):
+        try:
+            fields = next(_csv.reader(io.StringIO(header_line), delimiter=d), [])
+        except Exception:
+            fields = []
+        if len(fields) > best_n:
+            best, best_n = d, len(fields)
+    return best
+
+
+def csv_fallback(path, delimiter=None):
+    """.csv/.tsv -> escaped Markdown table. MarkItDown's native CSV converter does
+    NOT escape '|' or embedded newlines, so a cell containing a pipe silently adds a
+    phantom column and an Excel-style multiline cell (a quoted newline) splits the
+    row across lines - the exact breakage xlsx_fallback already guards against. Parse
+    with the csv module (correct RFC-4180 quoting) using the detected charset and
+    escape every cell via _md_cell so the table cannot break. Returns '' on empty
+    input so convert_one falls through to the native path."""
+    import csv as _csv
+    import io
+    enc = detect_charset(path)
+    with open(path, "rb") as fh:
+        data = fh.read()
+    try:
+        text = data.decode(enc)
+    except (UnicodeDecodeError, LookupError):
+        text = data.decode("latin-1")  # never fails; better than a crash/exit2
+    text = text.replace("\x00", "")  # a stray NUL would make csv.reader raise
+    if delimiter is None:
+        first = next((ln for ln in text.splitlines() if ln.strip()), "")
+        delimiter = _sniff_delimiter(first)
+    rows = list(_csv.reader(io.StringIO(text), delimiter=delimiter))
+    rows = [r for r in rows if any((c or "").strip() != "" for c in r)]
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    rows = [list(r) + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(_md_cell(c) for c in rows[0]) + " |",
+             "| " + " | ".join("---" for _ in range(width)) + " |"]
+    for r in rows[1:]:
+        lines.append("| " + " | ".join(_md_cell(c) for c in r) + " |")
+    return "\n".join(lines).strip() + "\n"
+
+
 def image_fallback(path):
     """Image -> Markdown metadata via Pillow: format, dimensions, embedded text, EXIF."""
     from PIL import Image, ExifTags
@@ -432,11 +568,19 @@ AUDIO_META_EXTS = {".mp3", ".m4a", ".flac", ".ogg", ".aac", ".wma"}
 ERROR_FALLBACKS = {".docx": docx_fallback, ".xlsx": xlsx_fallback}
 
 # Formats where a local extractor is MORE faithful than MarkItDown's native
-# backend, used as the PRIMARY path (native remains the fallback). MarkItDown
-# reads .xlsx via pandas, which coerces literal cell text like "NA", "N/A",
-# "NULL", "None" into missing values (NaN) - corrupting e.g. a region code "NA".
-# openpyxl preserves the literal stored values.
-PRIMARY_OVERRIDES = {".xlsx": xlsx_fallback}
+# backend, used as the PRIMARY path (native remains the fallback).
+#  - .xlsx: MarkItDown reads it via pandas, which coerces literal cell text like
+#    "NA", "N/A", "NULL", "None" into missing values (NaN) - corrupting e.g. a
+#    region code "NA". openpyxl preserves the literal stored values.
+#  - .csv/.tsv: MarkItDown's CSV converter does not escape '|' or embedded
+#    newlines, so a cell with a pipe adds a phantom column and a multiline cell
+#    splits the row (a broken table). csv_fallback escapes cells; it also tabulates
+#    .tsv (native passes TSV through as raw text) and sniffs ';' delimited CSVs.
+PRIMARY_OVERRIDES = {
+    ".xlsx": xlsx_fallback,
+    ".csv": csv_fallback,
+    ".tsv": lambda p: csv_fallback(p, delimiter="\t"),
+}
 
 
 def _empty_fallback_for(ext):
@@ -550,27 +694,56 @@ def resolve_output(multiple, output):
     return out_dir, out_file
 
 
+def _stdout_pipe_closed():
+    """The stdout consumer closed the pipe (e.g. `convert.py f | head`). The .md
+    file is already written and is the authoritative result, so a closed echo pipe
+    must not fail the run. Redirect stdout to devnull so the interpreter's
+    shutdown flush can't re-raise BrokenPipeError after we return."""
+    try:
+        fd = sys.stdout.fileno()
+    except Exception:
+        return
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, fd)
+        finally:
+            os.close(devnull)
+    except Exception:
+        pass
+
+
 def _echo_stdout(text):
     """Echo Markdown to stdout (single-input / no -o case) without crashing on a
-    Windows legacy-codepage console. The .md file is already written as UTF-8; if
-    the console codec can't encode a character (CJK, emoji, or anything outside
-    the active code page) sys.stdout.write raises UnicodeEncodeError, which would
-    otherwise turn a fully successful conversion into a false failure (exit 1).
-    On that error, write faithful UTF-8 bytes to the binary buffer instead, so a
-    piping caller still receives the real content."""
+    Windows legacy-codepage console OR a closed downstream pipe. The .md file is
+    already written as UTF-8; an echo problem must never turn a fully successful
+    conversion into a false failure. On a console codec error (CJK/emoji outside
+    the active code page) write faithful UTF-8 bytes to the binary buffer instead;
+    on a closed pipe (the common `convert.py f | head`/`| less` preview workflow,
+    which raises BrokenPipeError, a subclass of OSError - NOT UnicodeEncodeError)
+    stop cleanly."""
     try:
         sys.stdout.write(text)
         return
     except UnicodeEncodeError:
         pass
+    except (BrokenPipeError, OSError):
+        _stdout_pipe_closed()
+        return
     data = text.encode("utf-8", errors="replace")
     buf = getattr(sys.stdout, "buffer", None)
     if buf is not None:
-        buf.write(data)
-        buf.flush()
+        try:
+            buf.write(data)
+            buf.flush()
+        except (BrokenPipeError, OSError):
+            _stdout_pipe_closed()
     else:  # no binary buffer (rare wrapped stream): last-resort lossy echo
         enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-        sys.stdout.write(data.decode(enc, errors="replace"))
+        try:
+            sys.stdout.write(data.decode(enc, errors="replace"))
+        except (BrokenPipeError, OSError):
+            _stdout_pipe_closed()
 
 
 def main():
