@@ -49,37 +49,157 @@ SUPPORTED = ("PDF, Word (.docx), PowerPoint (.pptx), Excel (.xlsx/.xls), images 
 DETECT_BYTES = 262144  # bytes read for charset detection (avoid loading huge files)
 
 
-def ensure_markitdown():
-    """Import MarkItDown, installing 'markitdown[all]' on demand if needed.
-    pip output is sent to stderr so it never contaminates the Markdown on stdout."""
-    try:
-        from markitdown import MarkItDown  # noqa: F401
-        return
-    except ImportError:
-        pass
+MIN_MARKITDOWN = (0, 1, 6)  # minimum version this wrapper supports
+_MIN_SPEC = "markitdown[all]>=%s" % ".".join(map(str, MIN_MARKITDOWN))
+_BOOTSTRAP_GUARD = "_MARKITDOWN_BOOTSTRAPPED"  # set on re-exec to prevent loops
 
-    sys.stderr.write("markitdown not found - attempting to install 'markitdown[all]'...\n")
-    for cmd in (
-        [sys.executable, "-m", "pip", "install", "markitdown[all]"],
-        [sys.executable, "-m", "pip", "install", "--break-system-packages", "markitdown[all]"],
-    ):
+
+def _markitdown_version(py=None):
+    """Installed markitdown version tuple for interpreter *py* (current if None),
+    or None if it isn't importable there."""
+    if py is None or os.path.abspath(py) == os.path.abspath(sys.executable):
         try:
-            subprocess.run(cmd, check=True, stdout=sys.stderr, stderr=sys.stderr)
-            from markitdown import MarkItDown  # noqa: F401
-            return
+            import importlib
+            importlib.invalidate_caches()
+            import markitdown
+            v = getattr(markitdown, "__version__", "") or ""
+        except Exception:
+            return None
+    else:
+        try:
+            r = subprocess.run(
+                [py, "-c", "import markitdown,sys;sys.stdout.write(getattr(markitdown,'__version__','') or '')"],
+                capture_output=True, text=True)
+            v = r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return None
+    parts = tuple(int(x) for x in v.split(".")[:3] if x.isdigit())
+    return parts or (0,)
+
+
+def _markitdown_ok(py=None):
+    """True only if a version >= MIN_MARKITDOWN is importable by *py*."""
+    v = _markitdown_version(py)
+    return v is not None and v >= MIN_MARKITDOWN
+
+
+def _requirements_path():
+    """The skill's bundled requirements.txt (markitdown[all] + offline-fallback
+    libs), resolved relative to this script, or None if not found."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "requirements.txt")
+    return p if os.path.isfile(p) else None
+
+
+def _pip_install_markitdown(py):
+    """Install the skill's dependencies into interpreter *py*: the bundled
+    requirements.txt when present (markitdown[all] + the python-docx / openpyxl /
+    Pillow fallback libs the converter needs), else just the pinned markitdown[all].
+    The version pin (also carried by requirements.txt) stops pip silently
+    backtracking to an ancient release on a Python lacking modern wheels (notably
+    3.14). Returns True only if a satisfactory markitdown is importable after."""
+    req = _requirements_path()
+    specs = ["-r", req] if req else [_MIN_SPEC]
+    for extra in ([], ["--break-system-packages"]):
+        try:
+            subprocess.run([py, "-m", "pip", "install", *extra, *specs],
+                           stdout=sys.stderr, stderr=sys.stderr)
         except Exception:
             continue
+        if _markitdown_ok(py):
+            return True
+    return False
+
+
+def _find_compatible_base():
+    """Locate a Python 3.10-3.13 interpreter (the range the modern markitdown
+    installs cleanly on) to build a managed venv. Returns an exe path or None."""
+    probe = "import sys;print('%d.%d' % sys.version_info[:2]);print(sys.executable)"
+    candidates = []
+    if (3, 10) <= sys.version_info[:2] <= (3, 13):
+        candidates.append([sys.executable])
+    if os.name == "nt":
+        candidates += [["py", "-3.12"], ["py", "-3.11"], ["py", "-3.13"], ["py", "-3.10"]]
+    else:
+        candidates += [["python3.12"], ["python3.11"], ["python3.13"], ["python3.10"]]
+    for argv in candidates:
+        try:
+            r = subprocess.run([*argv, "-c", probe], capture_output=True, text=True)
+        except Exception:
+            continue
+        if r.returncode != 0:
+            continue
+        lines = r.stdout.splitlines()
+        if len(lines) >= 2:
+            ver = tuple(int(x) for x in lines[0].split(".")[:2] if x.isdigit())
+            exe = lines[1].strip()
+            if (3, 10) <= ver <= (3, 13) and exe:
+                return exe
+    return None
+
+
+def _managed_venv_python():
+    """(python_path, venv_dir) for the skill's dedicated managed venv."""
+    venv = os.path.join(os.path.expanduser("~"), ".markitdown-converter", "venv")
+    py = (os.path.join(venv, "Scripts", "python.exe") if os.name == "nt"
+          else os.path.join(venv, "bin", "python"))
+    return py, venv
+
+
+def _ensure_managed_venv():
+    """Return a managed-venv python that has a good markitdown, creating the venv
+    on first use. Returns None if no compatible base Python is available."""
+    venv_py, venv_dir = _managed_venv_python()
+    if os.path.isfile(venv_py) and _markitdown_ok(venv_py):
+        return venv_py
+    base = _find_compatible_base()
+    if not base:
+        return None
+    try:
+        os.makedirs(os.path.dirname(venv_dir), exist_ok=True)
+        sys.stderr.write("Setting up a managed MarkItDown environment (one-time) at %s ...\n" % venv_dir)
+        subprocess.run([base, "-m", "venv", venv_dir], check=True, stdout=sys.stderr, stderr=sys.stderr)
+        subprocess.run([venv_py, "-m", "pip", "install", "--upgrade", "pip"],
+                       stdout=sys.stderr, stderr=sys.stderr)
+    except Exception as e:
+        sys.stderr.write("Could not create managed environment: %s\n" % e)
+        return None
+    return venv_py if _pip_install_markitdown(venv_py) else None
+
+
+def ensure_markitdown():
+    """Make a compatible MarkItDown importable, by whatever means works:
+      1. use it if a recent-enough version is already importable;
+      2. install the version-pinned markitdown[all] into the current interpreter;
+      3. as a last resort, build/reuse a dedicated managed venv with a compatible
+         Python (3.10-3.13) and re-exec this script there.
+    All pip/bootstrap chatter goes to stderr so stdout stays clean Markdown."""
+    if _markitdown_ok():
+        return
+
+    if not os.environ.get(_BOOTSTRAP_GUARD):
+        sys.stderr.write("markitdown >= %s not available - installing '%s'...\n"
+                         % (".".join(map(str, MIN_MARKITDOWN)), _MIN_SPEC))
+        if _pip_install_markitdown(sys.executable):
+            return
+
+        venv_py = _ensure_managed_venv()
+        if venv_py and os.path.abspath(venv_py) != os.path.abspath(sys.executable):
+            sys.stderr.write("Re-running under the managed MarkItDown environment...\n")
+            env = dict(os.environ)
+            env[_BOOTSTRAP_GUARD] = "1"
+            try:
+                proc = subprocess.run([venv_py, os.path.abspath(__file__), *sys.argv[1:]], env=env)
+                sys.exit(proc.returncode)
+            except Exception as e:
+                sys.stderr.write("Could not launch managed environment: %s\n" % e)
 
     sys.stderr.write(
-        "\nERROR: could not import or install markitdown.\n"
-        "Install it manually and re-run:\n"
-        "    pip install 'markitdown[all]'   "
-        "(add --break-system-packages on a managed Python)\n"
+        "\nERROR: could not obtain a compatible markitdown (>= %s).\n"
+        "Install it on a Python 3.10-3.13 and re-run:\n"
+        "    pip install '%s'\n"
+        % (".".join(map(str, MIN_MARKITDOWN)), _MIN_SPEC)
     )
     sys.exit(1)
-
-
-MIN_MARKITDOWN = (0, 1, 6)  # version this wrapper was validated against
 
 
 def warn_if_old_markitdown():

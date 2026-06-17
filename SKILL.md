@@ -82,12 +82,20 @@ Install the full stack first (pinned in `requirements.txt`):
 pip install -r requirements.txt          # markitdown[all] + fallback libs
 ```
 
+> **Running the converter needs no manual setup.** `convert.py` makes a compatible
+> MarkItDown available itself: it uses an importable `markitdown>=0.1.6`, else installs
+> the pinned `markitdown[all]>=0.1.6` (the pin avoids pip silently downgrading to an
+> incompatible old release), and as a last resort — e.g. a Python like 3.14 with no
+> compatible wheels yet — builds a dedicated managed venv under
+> `~/.markitdown-converter/venv` with a compatible Python (3.10–3.13) and re-execs there.
+> The `pip install` above is for running the **test suite** and pre-warms the runtime.
+
 Then run the bundled tests — `tests/run_all.py` runs all of them:
 
 ```bash
 python tests/run_all.py            # all suites below, in sequence
-python tests/test_suite.py         # 36 format/encoding/output/error checks
-python tests/test_adversarial.py   # 16 edge cases (bad -o, collisions, big files, symlinks…)
+python tests/test_suite.py         # 48 format/encoding/output/error checks
+python tests/test_adversarial.py   # 18 edge cases (bad -o, collisions, big files, symlinks…)
 python tests/selftest.py           # quick smoke test
 python tests/verify_native.py      # confirm network/system-dependent backends (see below)
 ```

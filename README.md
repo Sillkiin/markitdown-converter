@@ -14,6 +14,13 @@ PDF · Word (`.docx`) · Excel (`.xlsx`/`.xls`) · PowerPoint (`.pptx`) · image
 pip install -r requirements.txt        # markitdown[all] + offline-fallback libs (+ test deps)
 ```
 
+> **Running the tool needs no manual install.** `convert.py` self-provisions a compatible
+> MarkItDown — it uses an importable `markitdown>=0.1.6`, else installs the pinned
+> `markitdown[all]>=0.1.6`, and on a Python that can't host it (e.g. 3.14, whose wheels
+> for the modern release don't exist yet) it builds a managed venv under
+> `~/.markitdown-converter/venv` with a compatible Python (3.10–3.13) and re-execs there.
+> `requirements.txt` is needed to run the **test suite** and pre-warms the runtime.
+
 ## Usage
 
 ```bash
@@ -60,7 +67,7 @@ python tests/run_all.py            # runs all suites
 ```
 
 - `selftest.py` — quick per-format smoke test
-- `test_suite.py` — 38 format / encoding / output / error checks
+- `test_suite.py` — 48 format / encoding / output / error checks
 - `test_adversarial.py` — 18 edge cases (bad `-o`, collisions, big files, symlinks, encodings, stdout)
 - `verify_native.py` — confirms network/system-dependent backends on your machine (`SKIP` when a backend isn't installed; only `FAIL` if an installed one errors)
 
